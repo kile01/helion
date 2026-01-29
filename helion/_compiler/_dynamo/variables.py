@@ -17,6 +17,8 @@ from torch._dynamo.variables.lists import TupleVariable
 from torch._higher_order_ops.triton_kernel_wrap import kernel_side_table
 
 from helion._compiler._dynamo.higher_order_ops import helion_kernel_wrapper_mutation
+from helion._compiler.op_utils import is_clone_node as _is_clone_node
+from helion._compiler.op_utils import is_view_op as _is_view_op
 from helion._compiler.type_propagation import TensorType
 from helion._compiler.type_propagation import TypeInfo
 
@@ -125,6 +127,65 @@ def _trace_to_host_tensor(
         return None
 
     return _trace(node)
+
+
+def _detect_cloned_inputs(
+    mutated_inputs: list[str],
+    param_vars: dict[str, VariableTracker],
+) -> list[str]:
+    """Detect which mutated inputs came from a clone operation.
+
+    This is crucial for correctly handling clone-then-mutate patterns like:
+        x_clone = x.clone()
+        result = mutating_kernel(x_clone, y)
+        return result, x + 1  # x should see pre-mutation value
+
+    When AOT autograd eliminates the clone, we need to know it was there
+    so Inductor can restore the clone semantics.
+    """
+    cloned_inputs = []
+
+    for name in mutated_inputs:
+        var = param_vars.get(name)
+        if var is None:
+            continue
+
+        proxy = var.as_proxy()
+        if proxy is None or not hasattr(proxy, "node"):
+            continue
+
+        fx_node = proxy.node
+
+        # Check if this node is a clone, or trace through views to find a clone
+        current = fx_node
+        visited = set()
+        found_clone = False
+
+        while current is not None and id(current) not in visited:
+            visited.add(id(current))
+
+            if _is_clone_node(current):
+                found_clone = True
+                break
+
+            # Trace through view operations using PyTorch's schema-based detection
+            is_view = False
+            if current.op == "call_function":
+                is_view = _is_view_op(current.target)
+            elif current.op == "call_method":
+                is_view = _is_view_op(current.target, method_name=current.target)
+
+            if is_view:
+                if current.args and isinstance(current.args[0], torch.fx.Node):
+                    current = current.args[0]
+                    continue
+
+            break
+
+        if found_clone:
+            cloned_inputs.append(name)
+
+    return cloned_inputs
 
 
 def _find_mutated_inputs(
@@ -432,6 +493,13 @@ class HelionKernelVariable(VariableTracker):
         # This determines: number of outputs, their shapes/dtypes, which inputs are mutated,
         # and which outputs alias which inputs
         output_spec = _infer_output_spec(self._kernel, ordered_args)
+
+        # Step 3.5: Detect which mutated inputs came from clone operations
+        # This info is passed to Inductor to restore clone semantics after AOT optimization
+        mutated_inputs = cast("list[str]", output_spec.get("mutated_inputs", []))
+        cloned_inputs = _detect_cloned_inputs(mutated_inputs, param_vars)
+        if cloned_inputs:
+            output_spec["cloned_inputs"] = cloned_inputs
 
         # Step 4: Emit a Higher-Order Op (HOP) node into the FX graph
         # The HOP encapsulates the entire Helion kernel call as a single graph node

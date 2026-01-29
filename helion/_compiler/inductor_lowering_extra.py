@@ -29,6 +29,8 @@ from helion._compiler._dynamo.higher_order_ops import get_helion_kernel
 from helion._compiler._dynamo.higher_order_ops import (
     helion_kernel_wrapper_mutation as _helion_hop,
 )
+from helion._compiler.op_utils import get_op_name as _get_op_name
+from helion._compiler.op_utils import is_view_op as _is_view_op
 
 inductor_lowering_dispatch: dict[
     Callable[..., object] | str, Callable[..., object]
@@ -174,18 +176,94 @@ def var_mean(
     )
 
 
+def _trace_to_base(fx_node: torch.fx.Node) -> torch.fx.Node:
+    """Trace back through view operations to find the base tensor.
+
+    Note: At Inductor level, clone operations are already eliminated by
+    AOT autograd. Clone detection is handled at Dynamo level via
+    cloned_inputs passed through output_spec.
+
+    Returns:
+        The base tensor after tracing through views.
+    """
+    current = fx_node
+
+    while True:
+        # Check for view operations using comprehensive detection from shared module
+        if current.op == "call_function":
+            if _is_view_op(current.target):
+                if len(current.args) > 0 and isinstance(current.args[0], torch.fx.Node):
+                    current = current.args[0]
+                    continue
+
+            # Check for getattr (like x.T which becomes getattr(x, "T"))
+            target_name = _get_op_name(current.target)
+            if target_name == "getattr" and len(current.args) >= 2:
+                attr_name = current.args[1]
+                if attr_name in ("T", "mT", "mH", "H"):
+                    if isinstance(current.args[0], torch.fx.Node):
+                        current = current.args[0]
+                        continue
+        break
+
+    return current
+
+
+def _output_depends_on(
+    output_nodes: set[torch.fx.Node],
+    target: torch.fx.Node,
+    graph: torch.fx.Graph,
+) -> bool:
+    """Check if any output transitively depends on target."""
+    # Build reverse dependency map: node -> nodes that use it
+    # Then check if target can reach any output
+
+    # Use forward search from target to see if we reach any output
+    visited: set[torch.fx.Node] = set()
+    queue = [target]
+
+    while queue:
+        node = queue.pop()
+        if node in visited:
+            continue
+        visited.add(node)
+
+        if node in output_nodes:
+            return True
+
+        # Add all users of this node to the queue
+        for user in node.users:
+            if user not in visited:
+                queue.append(user)
+
+    return False
+
+
 def _clone_mutated_graph_output_inputs(
     mutated_names: set[str],
     realized: dict[str, IRNode],
     realize_fn: Callable[[TensorBox], IRNode],
+    cloned_inputs: set[str],
 ) -> None:
-    """Clone realized inputs that are mutated AND also appear as graph outputs.
+    """Clone realized inputs that are mutated AND whose base is used by outputs.
 
-    When AOT autograd eliminates a user's clone, a mutated input may also
-    appear as a graph output that should retain its pre-mutation value.
-    This replaces the entry in ``realized`` with a fresh copy so the HOP
-    mutates the copy while the original buffer (still in V.graph.env)
-    remains available unmutated for the graph output.
+    When a user writes clone-then-mutate patterns like:
+        x_clone = x.clone()  # or x.T.clone(), x.view().clone()
+        result = kernel(x_clone)  # mutates x_clone
+        return result, x  # or x + 1, x.sum(), etc.
+
+    The clone may be eliminated by AOT autograd optimization. This function
+    restores clone semantics by using the cloned_inputs info passed from Dynamo:
+
+    1. cloned_inputs contains parameters that were derived from a clone operation
+       at the Dynamo level (before AOT optimization eliminates the clone).
+    2. For inputs in cloned_inputs that are also mutated, we check if the base
+       tensor (what was cloned from) is used by graph outputs.
+    3. If both conditions are true, we clone the buffer to prevent mutation
+       from affecting the original base tensor.
+
+    When an input is NOT in cloned_inputs (user intentionally mutates directly),
+    we don't clone because the mutation should be visible in the original tensor.
     """
     current_node: torch.fx.Node | None = getattr(V.graph, "current_node", None)
     if current_node is None:
@@ -196,7 +274,8 @@ def _clone_mutated_graph_output_inputs(
 
     # Collect FX nodes that are direct graph outputs
     output_fx_nodes: set[torch.fx.Node] = set()
-    for fx_node in V.graph.module.graph.nodes:
+    graph = V.graph.module.graph
+    for fx_node in graph.nodes:
         if fx_node.op == "output":
 
             def _collect(arg: object) -> None:
@@ -217,11 +296,25 @@ def _clone_mutated_graph_output_inputs(
     cloned: dict[torch.fx.Node, IRNode] = {}
     for name in mutated_names:
         fx_arg_node = fx_tensor_args.get(name)
-        if (
-            isinstance(fx_arg_node, torch.fx.Node)
-            and fx_arg_node in output_fx_nodes
-            and name in realized
-        ):
+        if not isinstance(fx_arg_node, torch.fx.Node) or name not in realized:
+            continue
+
+        # Check if this input was cloned at the Dynamo level.
+        # This info survives AOT autograd optimization.
+        was_cloned_at_dynamo = name in cloned_inputs
+
+        # Trace back through views to find the base tensor.
+        # Note: At the Inductor level, the clone is already eliminated,
+        # so we only trace through views here.
+        base_tensor = _trace_to_base(fx_arg_node)
+
+        # Check if any output depends on the base tensor (directly or transitively)
+        base_used_by_output = _output_depends_on(output_fx_nodes, base_tensor, graph)
+
+        # Clone if: the input was originally cloned AND the base is used by outputs
+        should_clone = was_cloned_at_dynamo and base_used_by_output
+
+        if should_clone:
             if fx_arg_node in cloned:
                 realized[name] = cloned[fx_arg_node]
             else:
@@ -273,8 +366,11 @@ def lower_helion_kernel(
     # the same buffer.  By giving the HOP a fresh copy, the original buffer
     # (still referenced via V.graph.env) stays unmutated for the graph output.
     mutated_names = set(cast("list[str]", output_spec.get("mutated_inputs", [])))
+    # cloned_inputs contains parameter names that were derived from a clone
+    # operation at the Dynamo level (before AOT optimization eliminates them)
+    cloned_inputs = set(cast("list[str]", output_spec.get("cloned_inputs", [])))
     if mutated_names:
-        _clone_mutated_graph_output_inputs(mutated_names, realized, realize)
+        _clone_mutated_graph_output_inputs(mutated_names, realized, realize, cloned_inputs)
 
     # Build ordered arg_names and inputs lists from realized
     arg_names = list(realized.keys())
